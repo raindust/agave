@@ -1175,7 +1175,7 @@ fn cpi_common<S: SyscallInvokeSigned>(
 // changes.
 //
 // When true is returned, the caller account must be updated after CPI. This
-// is only set for direct mapping when the pointer may have changed.
+// is only set for direct mapping when the pointer or permissions may have changed.
 fn update_callee_account(
     invoke_context: &InvokeContext,
     memory_mapping: &MemoryMapping,
@@ -1246,6 +1246,10 @@ fn update_callee_account(
     // Change the owner at the end so that we are allowed to change the lamports and data before
     if callee_account.get_owner() != caller_account.owner {
         callee_account.set_owner(caller_account.owner.as_ref())?;
+        // Ownership changes can revoke the caller's write access even when the
+        // callee receives the account read-only. Retain it for CPI-exit mapping
+        // synchronization so the caller cannot keep writing through a stale region.
+        must_update_caller |= direct_mapping;
     }
 
     Ok(must_update_caller)
@@ -2220,6 +2224,126 @@ mod tests {
         )
         .unwrap();
         assert_eq!(data, callee_account.get_data());
+    }
+
+    #[test]
+    fn test_readonly_cpi_owner_change_revokes_direct_mapping_writes() {
+        for original_data_len in [0, 8] {
+            for (direct_mapping, callee_writable, change_owner) in [
+                (true, false, true),
+                (true, false, false),
+                (true, true, true),
+                (false, false, true),
+                (false, true, true),
+            ] {
+                let transaction_accounts =
+                    transaction_with_one_writable_instruction_account(vec![0; original_data_len]);
+                let account = transaction_accounts[1].1.clone();
+                let key = transaction_accounts[1].0;
+                mock_invoke_context!(
+                    invoke_context,
+                    transaction_context,
+                    b"instruction data",
+                    transaction_accounts,
+                    &[0],
+                    &[1]
+                );
+                if direct_mapping {
+                    let mut feature_set = invoke_context.get_feature_set().clone();
+                    feature_set.activate(&bpf_account_data_direct_mapping::id(), 0);
+                    invoke_context.mock_set_feature_set(Arc::new(feature_set));
+                }
+
+                let mut mock_caller_account = MockCallerAccount::new(
+                    account.lamports(),
+                    *account.owner(),
+                    0xFFFFFFFF00000000,
+                    account.data(),
+                    direct_mapping,
+                );
+                let mut regions = mock_caller_account.regions.split_off(0);
+                regions.retain(|region| region.len != 0);
+                // The caller initially owns the account and can write both its data
+                // and its realloc padding. CPI may downgrade it to read-only.
+                for region in &regions {
+                    region.state.set(MemoryState::Writable);
+                }
+                let config = Config {
+                    aligned_memory_mapping: false,
+                    ..Config::default()
+                };
+                let memory_mapping =
+                    MemoryMapping::new(regions, &config, &SBPFVersion::V2).unwrap();
+                let caller_account = mock_caller_account.caller_account();
+                let vm_data_addr = caller_account.vm_data_addr;
+                let new_owner = if change_owner {
+                    Pubkey::new_unique()
+                } else {
+                    *account.owner()
+                };
+                *caller_account.owner = new_owner;
+                let caller_account = RefCell::new(Some(caller_account));
+                let metadata = SerializedAccountMetadata {
+                    original_data_len,
+                    vm_data_addr,
+                    vm_key_addr: 0,
+                    vm_lamports_addr: 0,
+                    vm_owner_addr: 0,
+                };
+                mock_create_vm!(_vm, Vec::new(), vec![metadata], &mut invoke_context);
+
+                let instruction_accounts = [InstructionAccount {
+                    index_in_transaction: 1,
+                    index_in_caller: 0,
+                    index_in_callee: 0,
+                    is_signer: false,
+                    is_writable: callee_writable,
+                }];
+                let accounts = translate_and_update_accounts(
+                    &instruction_accounts,
+                    &[0],
+                    &[&key],
+                    &[()],
+                    0,
+                    false,
+                    &mut invoke_context,
+                    &memory_mapping,
+                    |_, _, _, _, _| Ok(caller_account.borrow_mut().take().unwrap()),
+                )
+                .unwrap();
+                let callee_account = borrow_instruction_account!(invoke_context, 0);
+                assert_eq!(*callee_account.get_owner(), new_owner);
+                assert_eq!(callee_account.get_data().len(), original_data_len);
+                // A no-op callee leaves the reassigned, zero-initialized account
+                // untouched. Exercise the real CPI-exit permission synchronization.
+                if direct_mapping {
+                    if let Some(caller_account) = &accounts[1].1 {
+                        update_caller_account_perms(
+                            &memory_mapping,
+                            caller_account,
+                            &callee_account,
+                            false,
+                        )
+                        .unwrap();
+                    }
+                    if original_data_len != 0 {
+                        assert_eq!(
+                            memory_mapping
+                                .region(AccessType::Store, vm_data_addr)
+                                .is_ok(),
+                            !change_owner
+                        );
+                    }
+                    assert_eq!(
+                        memory_mapping
+                            .region(AccessType::Store, vm_data_addr + original_data_len as u64)
+                            .is_ok(),
+                        !change_owner
+                    );
+                    assert!(callee_account.get_data().iter().all(|byte| *byte == 0));
+                }
+            }
+        }
     }
 
     #[test]
