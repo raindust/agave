@@ -830,6 +830,22 @@ impl<FG: ForkGraph> ProgramCache<FG> {
         self.fork_graph = Some(fork_graph);
     }
 
+    /// Isolate a consensus runtime transition from banks using the old cache.
+    /// Retain entries and their visibility metadata, but let environment matching
+    /// reload compiled programs under the new environment. In-flight loads and
+    /// anticipated epoch environments belong to the old cache and are not shared.
+    pub fn fork_with_environments(&self, environments: ProgramRuntimeEnvironments) -> Self {
+        let mut cache = Self::new(self.latest_root_slot, self.latest_root_epoch);
+        let IndexImplementation::V1 { entries, .. } = &self.index;
+        cache.index = IndexImplementation::V1 {
+            entries: entries.clone(),
+            loading_entries: Mutex::new(HashMap::new()),
+        };
+        cache.environments = environments;
+        cache.fork_graph = self.fork_graph.clone();
+        cache
+    }
+
     /// Returns the current environments depending on the given epoch
     pub fn get_environments_for_epoch(&self, epoch: Epoch) -> ProgramRuntimeEnvironments {
         if epoch != self.latest_root_epoch {
