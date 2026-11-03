@@ -97,7 +97,10 @@ use {
     solana_perf::perf_libs,
     solana_program_runtime::{
         invoke_context::BuiltinFunctionWithContext,
-        loaded_programs::{ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType},
+        loaded_programs::{
+            ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
+            ProgramRuntimeEnvironments,
+        },
         timings::{ExecuteTimingType, ExecuteTimings},
     },
     solana_sdk::{
@@ -223,6 +226,8 @@ mod address_lookup_table;
 pub mod bank_hash_details;
 mod builtin_programs;
 pub mod builtins;
+#[cfg(test)]
+mod direct_mapping_tests;
 pub mod epoch_accounts_hash_utils;
 mod fee_distribution;
 mod metrics;
@@ -582,6 +587,7 @@ impl PartialEq for Bank {
             transaction_log_collector_config: _,
             transaction_log_collector: _,
             feature_set: _,
+            bpf_account_data_direct_mapping_disable_slot: _,
             reserved_account_keys: _,
             drop_callback: _,
             freeze_started: _,
@@ -844,6 +850,9 @@ pub struct Bank {
 
     pub feature_set: Arc<FeatureSet>,
 
+    /// Network policy, inherited by children and supplied again on snapshot restore.
+    bpf_account_data_direct_mapping_disable_slot: Option<Slot>,
+
     /// Set of reserved account keys that cannot be write locked
     reserved_account_keys: Arc<ReservedAccountKeys>,
 
@@ -989,6 +998,7 @@ impl Bank {
             ),
             transaction_log_collector: Arc::<RwLock<TransactionLogCollector>>::default(),
             feature_set: Arc::<FeatureSet>::default(),
+            bpf_account_data_direct_mapping_disable_slot: None,
             reserved_account_keys: Arc::<ReservedAccountKeys>::default(),
             drop_callback: RwLock::new(OptionalDropCallback(None)),
             freeze_started: AtomicBool::default(),
@@ -1042,6 +1052,8 @@ impl Bank {
         let accounts = Accounts::new(Arc::new(accounts_db));
         let mut bank = Self::default_with_accounts(accounts);
         bank.ancestors = Ancestors::from(vec![bank.slot()]);
+        bank.bpf_account_data_direct_mapping_disable_slot =
+            runtime_config.bpf_account_data_direct_mapping_disable_slot;
         bank.compute_budget = runtime_config.compute_budget;
         bank.transaction_account_lock_limit = runtime_config.transaction_account_lock_limit;
         bank.transaction_debug_keys = debug_keys;
@@ -1247,6 +1259,8 @@ impl Bank {
             transaction_log_collector_config,
             transaction_log_collector: Arc::new(RwLock::new(TransactionLogCollector::default())),
             feature_set: Arc::clone(&feature_set),
+            bpf_account_data_direct_mapping_disable_slot: parent
+                .bpf_account_data_direct_mapping_disable_slot,
             reserved_account_keys: parent.reserved_account_keys.clone(),
             drop_callback: RwLock::new(OptionalDropCallback(
                 parent
@@ -1281,6 +1295,7 @@ impl Bank {
         });
 
         // Following code may touch AccountsDb, requiring proper ancestors
+        new.apply_scheduled_direct_mapping_deactivation();
         let (_, update_epoch_time_us) = measure_us!({
             if parent.epoch() < new.epoch() {
                 new.process_new_epoch(
@@ -1644,6 +1659,8 @@ impl Bank {
             ),
             transaction_log_collector: Arc::<RwLock<TransactionLogCollector>>::default(),
             feature_set: Arc::<FeatureSet>::default(),
+            bpf_account_data_direct_mapping_disable_slot: runtime_config
+                .bpf_account_data_direct_mapping_disable_slot,
             reserved_account_keys: Arc::<ReservedAccountKeys>::default(),
             drop_callback: RwLock::new(OptionalDropCallback(None)),
             freeze_started: AtomicBool::new(fields.hash != Hash::default()),
@@ -6355,6 +6372,41 @@ impl Bank {
         self.feature_set = Arc::new(feature_set);
     }
 
+    fn direct_mapping_deactivation_is_due(&self) -> bool {
+        self.bpf_account_data_direct_mapping_disable_slot
+            .is_some_and(|slot| self.slot() >= slot)
+    }
+
+    fn apply_scheduled_direct_mapping_deactivation(&mut self) {
+        let id = solana_sdk::feature_set::bpf_account_data_direct_mapping::id();
+        if !self.direct_mapping_deactivation_is_due() || !self.feature_set.is_active(&id) {
+            return;
+        }
+        self.deactivate_feature(&id);
+        let environments = ProgramRuntimeEnvironments {
+            program_runtime_v1: Arc::new(
+                create_program_runtime_environment_v1(
+                    &self.feature_set,
+                    &self.compute_budget().unwrap_or_default(),
+                    false,
+                    false,
+                )
+                .unwrap(),
+            ),
+            program_runtime_v2: Arc::new(create_program_runtime_environment_v2(
+                &self.compute_budget().unwrap_or_default(),
+                false,
+            )),
+        };
+        let cache = self
+            .transaction_processor
+            .program_cache
+            .read()
+            .unwrap()
+            .fork_with_environments(environments);
+        self.transaction_processor.program_cache = Arc::new(RwLock::new(cache));
+    }
+
     pub fn activate_feature(&mut self, id: &Pubkey) {
         let mut feature_set = Arc::make_mut(&mut self.feature_set).clone();
         feature_set.inactive.remove(id);
@@ -6512,6 +6564,16 @@ impl Bank {
             } else {
                 inactive.insert(*feature_id);
             }
+        }
+
+        // The genesis feature account remains intact for historical replay. This
+        // policy is supplied on genesis/snapshot load and inherited by children,
+        // so neither epoch activation nor restoration can re-enable the feature.
+        if self.direct_mapping_deactivation_is_due() {
+            let id = solana_sdk::feature_set::bpf_account_data_direct_mapping::id();
+            active.remove(&id);
+            inactive.insert(id);
+            pending.remove(&id);
         }
 
         (FeatureSet { active, inactive }, pending)
