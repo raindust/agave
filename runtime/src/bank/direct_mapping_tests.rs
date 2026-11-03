@@ -7,7 +7,8 @@ use {
         epoch_schedule::EpochSchedule,
         feature_set::{
             blake3_syscall_enabled, bpf_account_data_direct_mapping,
-            enable_program_runtime_v2_and_loader_v4, zk_token_sdk_enabled,
+            enable_program_runtime_v2_and_loader_v4, zk_elgamal_proof_program_enabled,
+            zk_token_sdk_enabled,
         },
         instruction::Instruction,
         signature::{Keypair, Signer},
@@ -21,6 +22,7 @@ fn unsafe_feature_ids() -> HashSet<Pubkey> {
         bpf_account_data_direct_mapping::id(),
         blake3_syscall_enabled::id(),
         zk_token_sdk_enabled::id(),
+        zk_elgamal_proof_program_enabled::id(),
         enable_program_runtime_v2_and_loader_v4::id(),
     ]
     .into_iter()
@@ -329,6 +331,7 @@ fn scheduled_feature_deactivation_masks_all_configured_features_and_builtins() {
         .map(|(id, _)| id)
         .collect();
     assert!(parent_programs.contains(&solana_zk_token_sdk::zk_token_proof_program::id()));
+    assert!(parent_programs.contains(&solana_zk_sdk::zk_elgamal_proof_program::id()));
     assert!(parent_programs.contains(&solana_sdk::loader_v4::id()));
 
     let mut child = Bank::new_from_parent(parent, &Pubkey::default(), 7);
@@ -351,6 +354,7 @@ fn scheduled_feature_deactivation_masks_all_configured_features_and_builtins() {
         .map(|(id, _)| id)
         .collect();
     assert!(!child_programs.contains(&solana_zk_token_sdk::zk_token_proof_program::id()));
+    assert!(!child_programs.contains(&solana_zk_sdk::zk_elgamal_proof_program::id()));
     assert!(!child_programs.contains(&solana_sdk::loader_v4::id()));
 
     child.apply_feature_activations(ApplyFeatureActivationsCaller::NewFromParent, false);
