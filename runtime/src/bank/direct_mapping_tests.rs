@@ -333,6 +333,19 @@ fn scheduled_feature_deactivation_masks_all_configured_features_and_builtins() {
     assert!(parent_programs.contains(&solana_zk_token_sdk::zk_token_proof_program::id()));
     assert!(parent_programs.contains(&solana_zk_sdk::zk_elgamal_proof_program::id()));
     assert!(parent_programs.contains(&solana_sdk::loader_v4::id()));
+    let deactivated_builtin_ids = [
+        solana_zk_token_sdk::zk_token_proof_program::id(),
+        solana_zk_sdk::zk_elgamal_proof_program::id(),
+        solana_sdk::loader_v4::id(),
+    ];
+    for id in deactivated_builtin_ids {
+        assert!(parent
+            .transaction_processor
+            .builtin_program_ids
+            .read()
+            .unwrap()
+            .contains(&id));
+    }
 
     let mut child = Bank::new_from_parent(parent, &Pubkey::default(), 7);
     for id in unsafe_feature_ids() {
@@ -356,6 +369,14 @@ fn scheduled_feature_deactivation_masks_all_configured_features_and_builtins() {
     assert!(!child_programs.contains(&solana_zk_token_sdk::zk_token_proof_program::id()));
     assert!(!child_programs.contains(&solana_zk_sdk::zk_elgamal_proof_program::id()));
     assert!(!child_programs.contains(&solana_sdk::loader_v4::id()));
+    for id in deactivated_builtin_ids {
+        assert!(!child
+            .transaction_processor
+            .builtin_program_ids
+            .read()
+            .unwrap()
+            .contains(&id));
+    }
 
     child.apply_feature_activations(ApplyFeatureActivationsCaller::NewFromParent, false);
     for id in unsafe_feature_ids() {

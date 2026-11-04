@@ -6410,12 +6410,21 @@ impl Bank {
             .read()
             .unwrap()
             .fork_with_environments(environments);
-        cache.remove_programs(BUILTINS.iter().filter_map(|builtin| {
-            builtin
-                .enable_feature_id
-                .filter(|id| newly_deactivated.contains(id))
-                .map(|_| builtin.program_id)
-        }));
+        let deactivated_builtin_ids: HashSet<_> = BUILTINS
+            .iter()
+            .filter_map(|builtin| {
+                builtin
+                    .enable_feature_id
+                    .filter(|id| newly_deactivated.contains(id))
+                    .map(|_| builtin.program_id)
+            })
+            .collect();
+        cache.remove_programs(deactivated_builtin_ids.iter().copied());
+        self.transaction_processor
+            .builtin_program_ids
+            .write()
+            .unwrap()
+            .retain(|id| !deactivated_builtin_ids.contains(id));
         self.transaction_processor.program_cache = Arc::new(RwLock::new(cache));
     }
 
