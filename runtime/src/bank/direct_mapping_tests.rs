@@ -5,7 +5,11 @@ use {
     solana_sdk::{
         bpf_loader,
         epoch_schedule::EpochSchedule,
-        feature_set::bpf_account_data_direct_mapping,
+        feature_set::{
+            blake3_syscall_enabled, bpf_account_data_direct_mapping,
+            enable_program_runtime_v2_and_loader_v4, zk_elgamal_proof_program_enabled,
+            zk_token_sdk_enabled,
+        },
         instruction::Instruction,
         signature::{Keypair, Signer},
         system_program,
@@ -13,12 +17,29 @@ use {
     tempfile::TempDir,
 };
 
+fn unsafe_feature_ids() -> HashSet<Pubkey> {
+    [
+        bpf_account_data_direct_mapping::id(),
+        blake3_syscall_enabled::id(),
+        zk_token_sdk_enabled::id(),
+        zk_elgamal_proof_program_enabled::id(),
+        enable_program_runtime_v2_and_loader_v4::id(),
+    ]
+    .into_iter()
+    .collect()
+}
+
 fn genesis_and_runtime_config(disable_slot: Option<Slot>) -> (GenesisConfig, RuntimeConfig) {
     let (mut genesis, _) = solana_sdk::genesis_config::create_genesis_config(1_000_000_000);
     genesis.epoch_schedule = EpochSchedule::custom(32, 32, false);
     activate_feature(&mut genesis, bpf_account_data_direct_mapping::id());
     let runtime = RuntimeConfig {
-        bpf_account_data_direct_mapping_disable_slot: disable_slot,
+        feature_deactivation: disable_slot.map(|slot| FeatureDeactivationConfig {
+            slot,
+            feature_ids: [bpf_account_data_direct_mapping::id()]
+                .into_iter()
+                .collect(),
+        }),
         ..RuntimeConfig::default()
     };
     (genesis, runtime)
@@ -279,5 +300,65 @@ fn direct_mapping_hard_fork_snapshot_restore_before_and_after() {
             restored = Arc::new(Bank::new_from_parent(restored, &Pubkey::default(), slot));
             assert_direct_mapping(&restored, slot < 7);
         }
+    }
+}
+
+#[test]
+fn scheduled_feature_deactivation_masks_all_configured_features_and_builtins() {
+    let (mut genesis, _) = solana_sdk::genesis_config::create_genesis_config(1_000_000_000);
+    for id in unsafe_feature_ids() {
+        activate_feature(&mut genesis, id);
+    }
+    let runtime = RuntimeConfig {
+        feature_deactivation: Some(FeatureDeactivationConfig {
+            slot: 7,
+            feature_ids: unsafe_feature_ids(),
+        }),
+        ..RuntimeConfig::default()
+    };
+    let parent = Arc::new(new_bank(&genesis, &runtime));
+    let parent = Arc::new(Bank::new_from_parent(parent, &Pubkey::default(), 6));
+    for id in unsafe_feature_ids() {
+        assert!(parent.feature_set.is_active(&id));
+    }
+    let parent_programs: HashSet<_> = parent
+        .transaction_processor
+        .program_cache
+        .read()
+        .unwrap()
+        .get_flattened_entries_for_tests()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(parent_programs.contains(&solana_zk_token_sdk::zk_token_proof_program::id()));
+    assert!(parent_programs.contains(&solana_zk_sdk::zk_elgamal_proof_program::id()));
+    assert!(parent_programs.contains(&solana_sdk::loader_v4::id()));
+
+    let mut child = Bank::new_from_parent(parent, &Pubkey::default(), 7);
+    for id in unsafe_feature_ids() {
+        assert!(!child.feature_set.is_active(&id));
+        assert_eq!(
+            feature::from_account(&child.get_account(&id).unwrap())
+                .unwrap()
+                .activated_at,
+            Some(0)
+        );
+    }
+    let child_programs: HashSet<_> = child
+        .transaction_processor
+        .program_cache
+        .read()
+        .unwrap()
+        .get_flattened_entries_for_tests()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(!child_programs.contains(&solana_zk_token_sdk::zk_token_proof_program::id()));
+    assert!(!child_programs.contains(&solana_zk_sdk::zk_elgamal_proof_program::id()));
+    assert!(!child_programs.contains(&solana_sdk::loader_v4::id()));
+
+    child.apply_feature_activations(ApplyFeatureActivationsCaller::NewFromParent, false);
+    for id in unsafe_feature_ids() {
+        assert!(!child.feature_set.is_active(&id));
     }
 }
